@@ -10,6 +10,11 @@ Use this when the project has a world map, location selection screen, or area-ba
 3. [Map Screen](#3-map-screen)
 4. [Travel Logic](#4-travel-logic)
 5. [Mini-Map / Area HUD](#5-mini-map--area-hud)
+6. [Flat Sandbox Variant (No Connections)](#6-flat-sandbox-variant-no-connections)
+7. [Animated Hotspot Indicators](#7-animated-hotspot-indicators)
+8. [Sub-Zones Within a Location](#8-sub-zones-within-a-location)
+9. [Locked Hotspot with Reason Tooltip](#9-locked-hotspot-with-reason-tooltip)
+10. [Travel Cost (Optional)](#10-travel-cost-optional)
 
 ---
 
@@ -281,3 +286,253 @@ screen area_navigation():
                         Jump("enter_room"),
                     ]
 ```
+
+---
+
+## 6. Flat Sandbox Variant (No Connections)
+
+For sandbox / life-sim games where every unlocked location should be **reachable from anywhere** (no travel routing). Skip the `connections` field entirely and replace `get_available_locations()`:
+
+```renpy
+init python:
+
+    def get_available_locations_flat():
+        """Sandbox variant: all unlocked locations are reachable, regardless of position."""
+        return [loc for loc in LOCATIONS.values() if loc.is_unlocked()]
+```
+
+When defining locations, omit `connections=[...]` or set to `None`. The map screen then shows every unlocked hotspot as clickable. Use the flat variant when:
+- The game is set in a city / single area where travel is implicit.
+- You want lower friction in slot-based time systems (don't waste a turn on travel between two rooms).
+- The narrative doesn't depend on adjacency or path-finding.
+
+---
+
+## 7. Animated Hotspot Indicators
+
+Make hotspots visually communicate "something is happening here" — pending NPC, active quest, special event.
+
+```renpy
+# screens/map.rpy — enhanced markers
+
+init python:
+
+    def hotspot_indicator(loc_id):
+        """
+        Return an indicator string for visual state of a hotspot.
+        - "event"  : a quest objective points here, or NPC waiting
+        - "npc"    : a known NPC is currently at this location
+        - "new"    : location just unlocked, not yet visited
+        - "normal" : nothing special
+        """
+        # Quest-driven indicator
+        for q in store.quest_manager.active_quests():
+            for obj in getattr(q, "objectives", []):
+                if isinstance(obj, LocationObjective) and obj.location_id == loc_id and not obj.is_complete():
+                    return "event"
+        # NPC presence (cross-skill with renpy-adult-vn npc_schedule)
+        try:
+            if npcs_at_location(loc_id):
+                return "npc"
+        except NameError:
+            pass
+        # New unlock
+        if not store.visited_locations.get(loc_id, False):
+            return "new"
+        return "normal"
+```
+
+```renpy
+transform hotspot_glow:
+    ease 0.6 alpha 0.6
+    ease 0.6 alpha 1.0
+    repeat
+
+
+# Inside world_map_screen, augment each marker:
+for loc_id, loc in LOCATIONS.items():
+    if loc.is_unlocked():
+        $ xpos = int(loc.map_pos[0] * 1280)
+        $ ypos = int(loc.map_pos[1] * 720)
+        $ ind = hotspot_indicator(loc_id)
+
+        imagebutton:
+            xpos xpos ypos ypos anchor (0.5, 0.5)
+            idle  "images/maps/[loc.icon].png"
+            hover "images/maps/[loc.icon]_hover.png"
+            action [SetVariable("_map_travel_target", loc_id), Return("travel")]
+
+            # Overlay glow for events / NPCs
+            if ind in ("event", "npc"):
+                at hotspot_glow
+
+            # Badge for "new"
+            if ind == "new":
+                add "images/maps/badge_new.png" xpos 16 ypos -10
+```
+
+---
+
+## 8. Sub-Zones Within a Location
+
+Some locations are large enough that they need an internal sub-menu — for example a casino with separate "blackjack room", "bar", "bathroom", "private salon". Different from the dungeon Room pattern (Section 5): sub-zones are usually a flat menu, not a navigation grid.
+
+```renpy
+init python:
+
+    class SubZone:
+        """A sub-area inside a location. Selectable from a sub-menu."""
+
+        def __init__(self, zone_id, name, entry_label,
+                     unlock_condition=None, npc_present=None):
+            self.zone_id          = zone_id
+            self.name             = name
+            self.entry_label      = entry_label
+            self.unlock_condition = unlock_condition
+            self.npc_present      = npc_present   # callable() → npc_id or None
+
+
+    # Attach sub-zones to a Location by extending the data
+    Location.sub_zones = None   # default: no sub-zones
+
+
+    LOCATIONS["casino_premium"].sub_zones = [
+        SubZone("vip_blackjack",  "VIP Blackjack",
+                "casino_premium_vip_blackjack",
+                unlock_condition=lambda: store.influence >= 50),
+        SubZone("private_salon",  "Private Salon",
+                "casino_premium_private_salon"),
+        SubZone("bar",            "Bar",
+                "casino_premium_bar"),
+        SubZone("bathroom",       "Bathroom",
+                "casino_premium_bathroom"),
+    ]
+```
+
+**Sub-zone selector screen** — shown when entering a location with `sub_zones`:
+
+```renpy
+screen sub_zone_picker(location):
+    modal True
+    zorder 30
+    frame:
+        xalign 0.5 yalign 0.5
+        padding (24, 20)
+        vbox:
+            spacing 12
+            text "[location.name]" size 22 bold True xalign 0.5
+            text "Where do you want to go?" size 14 color "#bbb" xalign 0.5
+            for zone in location.sub_zones:
+                $ unlocked = zone.unlock_condition is None or zone.unlock_condition()
+                hbox:
+                    spacing 8
+                    textbutton "[zone.name]":
+                        action [Return("zone"), SetVariable("_sub_zone_target", zone.entry_label)]
+                        sensitive unlocked
+                    if not unlocked:
+                        text "(locked)" size 12 color "#888"
+            textbutton "Leave" action Return("leave") xalign 0.5
+```
+
+**In travel_to_location**, hand off to sub-zone picker when applicable:
+
+```renpy
+label travel_to_location:
+    python:
+        target_id  = store._map_travel_target
+        target_loc = LOCATIONS.get(target_id)
+        store._map_travel_target = None
+    $ visited_locations[target_id] = True
+    $ current_location = target_id
+
+    if target_loc.sub_zones:
+        call screen sub_zone_picker(target_loc)
+        if _return == "zone":
+            call expression store._sub_zone_target
+        return
+    elif target_loc.entry_label:
+        call expression target_loc.entry_label
+    return
+```
+
+---
+
+## 9. Locked Hotspot with Reason Tooltip
+
+When a hotspot is locked, show *why* on hover instead of just an opaque dim icon.
+
+```renpy
+init python:
+
+    def location_lock_reason(loc):
+        """Return a human-readable string explaining why this location is locked."""
+        if loc.unlock_condition is None or loc.unlock_condition():
+            return None
+        # Custom reason factory per location
+        return getattr(loc, "lock_reason", lambda: "Requirements not met.")()
+
+
+    # When defining locations, attach a `lock_reason` callable
+    LOCATIONS["congress"].lock_reason = lambda: "Requires Influence ≥ 25"
+    LOCATIONS["quinta_nordelta"].lock_reason = lambda: "Requires an invitation."
+    LOCATIONS["high_court"].lock_reason = lambda: "Requires Influence ≥ 60 and judicial connections."
+```
+
+```renpy
+# In world_map_screen, surface the reason as tooltip on locked markers
+for loc_id, loc in LOCATIONS.items():
+    $ unlocked = loc.is_unlocked()
+    $ reason   = None if unlocked else location_lock_reason(loc)
+    imagebutton:
+        idle "images/maps/[loc.icon].png" if unlocked else "images/maps/[loc.icon]_dim.png"
+        sensitive unlocked
+        tooltip (loc.name if unlocked else "{} — {}".format(loc.name, reason))
+        action [SetVariable("_map_travel_target", loc_id), Return("travel")]
+```
+
+---
+
+## 10. Travel Cost (Optional)
+
+Some games charge slots / energy / money for traveling. Disabled by default — opt-in by configuring the cost handler.
+
+```renpy
+init python:
+
+    # Default: free travel
+    default travel_cost_config = {
+        "slot_cost":   0,    # how many time slots a travel consumes
+        "money_cost":  0,    # cash cost
+        "energy_cost": 0,    # energy cost
+    }
+
+
+    def apply_travel_cost():
+        """Charge the configured travel cost. Returns True if affordable."""
+        cfg = store.travel_cost_config
+        if store.player_survival.money < cfg["money_cost"]:
+            renpy.notify("Not enough money to travel.")
+            return False
+        if store.player_survival.energy < cfg["energy_cost"]:
+            renpy.notify("Too tired to travel.")
+            return False
+        store.player_survival.modify("money",  -cfg["money_cost"])
+        store.player_survival.modify("energy", -cfg["energy_cost"])
+        for _ in range(cfg["slot_cost"]):
+            spend_action(1)
+        return True
+```
+
+```renpy
+# Hook into travel_to_location:
+label travel_to_location:
+    if not apply_travel_cost():
+        return   # cancelled, can't afford
+    # ... existing travel logic
+```
+
+For Politicuck-style sandbox: keep all costs at 0 by default; only meaningful **actions** consume slots. Document this clearly in your game's wiki / tutorial so players understand the time economy.
+
+**Cross-references**:
+- NPC presence by period/day: `renpy-adult-vn.md` § NPC Scheduling.
+- Day-of-week gating of locations: `renpy-survival.md` § Day-of-Week Gating.
