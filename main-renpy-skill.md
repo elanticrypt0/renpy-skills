@@ -5,10 +5,12 @@ description: >
   Triggers include: starting a new Ren'Py game, structuring a Ren'Py project, writing Ren'Py script (.rpy files),
   asking about best practices, dialogue systems, character definitions, screen language, transforms, transitions,
   image/audio management, save/load, flags and variables, routing/branching, menus, minigames, maps, inventory,
-  RPG stats, persistent data, or anything related to Ren'Py development.
+  RPG stats, persistent data, survival mechanics, time/day cycles, quest systems, sandbox free-roam,
+  relationship trees, scene unlocking, gallery systems, NPC scheduling, adult content gating,
+  or anything related to Ren'Py development.
   Use this even when the user doesn't say "Ren'Py skill" — if they mention labels, jumps, calls, `define`, `default`,
   `screen`, `.rpy` files, or visual novel mechanics, this skill is relevant.
-  Primary focus: Visual Novels with optional subsystems (RPG stats, maps, inventory, minigames).
+  Primary focus: Visual Novels with optional subsystems (RPG stats, maps, inventory, minigames, survival, quests, sandbox/adult VN).
 ---
 
 # Ren'Py Visual Novel Project Skill
@@ -22,6 +24,10 @@ clean, readable script, reusable components, clear separation of concerns, and m
 - Maps and world navigation → `references/renpy-maps.md`
 - Minigames → `references/renpy-minigames.md`
 - UI / Screen Language deep-dive → `references/renpy-screens.md`
+- Survival stats & time/day cycle → `references/renpy-survival.md`
+- Quest / mission system → `references/renpy-quests.md`
+- Inventory system (5 item types, equipment, gifts, quest items) → `references/renpy-inventory.md`
+- Sandbox / adult VN (relationship trees, scenes, gallery, NPC scheduling) → `references/renpy-adult-vn.md`
 
 ---
 
@@ -51,7 +57,20 @@ game/
 │   ├── flags.rpy            # All default/define for game state
 │   ├── inventory_system.rpy # Inventory logic (if used)
 │   ├── stats_system.rpy     # RPG stats logic (if used)
+│   ├── debug_system.rpy     # Optional: debug toggles, panel (if used)
 │   └── audio_manager.rpy    # Music/sfx helpers (if used)
+│
+├── minigames/               # Optional: one file per minigame
+│   ├── blackjack.rpy
+│   └── memory.rpy
+│
+├── gallery/                 # Optional: scene registry + gallery screen
+│   ├── scenes_registry.rpy
+│   └── gallery_screen.rpy
+│
+├── tl/                      # Optional: translations (i18n)
+│   ├── english/
+│   └── portuguese/
 │
 ├── images/
 │   └── (Ren'Py auto-detects images here)
@@ -483,6 +502,55 @@ Before shipping any label block:
 - [ ] `persistent.*` used only for cross-playthrough data
 - [ ] No story content in `script.rpy` (entry point only)
 - [ ] Deep nesting flattened into separate labels
+- [ ] i18n: `config.has_autosave_locale_*` enabled if shipping with translations
+- [ ] If mobile target: variant-aware screens for `small` / `touch`
+- [ ] If adult content: +18 disclaimer splash present and gated by `persistent.adult_confirmed`
+- [ ] Debug mode (if used) disabled in release build (`config.developer = False`)
+
+---
+
+## 12.5. Mobile / Multi-Platform
+
+If targeting Android (or iOS where allowed), Ren'Py provides `renpy.variant` for per-platform UI:
+
+```renpy
+# In screen definitions
+screen game_hud():
+    if renpy.variant("small"):
+        use game_hud_mobile()
+    else:
+        use game_hud_pc()
+```
+
+**Common variants**:
+- `"pc"` — desktop default
+- `"small"` — typically Android phones
+- `"touch"` — any touchscreen device
+- `"tablet"` — tablet form factor
+
+**Mobile-specific considerations**:
+- **Touch targets ≥ 44×44 px** (Apple HIG / Material Design guideline). Increase hitboxes on `imagebutton`.
+- **No hover state** on mobile — replace hover tooltips with long-press or alternative cues.
+- **Landscape only** for VN content (force `config.gl_resize` and orientation in `options.rpy`).
+- **Smaller text legibility**: bump dialogue text size by 1.1× on `small` variant.
+- **Save slots layout**: vertical scrolling vs grid on PC.
+
+To test mobile layouts on desktop, set `config.variants = ["small", "touch"]` temporarily.
+
+See `references/renpy-screens.md` § Responsive Layouts for full HUD examples.
+
+---
+
+## 12.6. Debug Mode (Brief Reference)
+
+Two-tier debug system pattern:
+
+- **Debug Full** — enabled when `config.developer = True` (development build). Adds Ren'Py's built-in console (Shift+O), dev menu (Shift+D), Shift+R reload, plus a custom panel with stat editors, time skips, location unlocks, etc.
+- **Debug Lite** — accessible in release builds via a hidden sequence (e.g., 7 clicks on logo within 5s, or `Ctrl+Shift+M`). Reduced toggle set, no Python console. Persistent in `persistent.debug_lite_enabled`.
+
+Watermark "DEBUG MODE" in the corner whenever any debug is active. Achievements unlocked in a debug session should not count toward cross-save persistent flags.
+
+(Full pattern lives in a project-specific `systems/debug_system.rpy` — consider extracting a reusable skill if you ship multiple Ren'Py games.)
 
 ---
 
@@ -492,9 +560,51 @@ When the project grows beyond core VN mechanics, read the relevant reference:
 
 | Feature | Reference File |
 |---|---|
-| RPG stats, leveling, skills | `references/renpy-rpg.md` |
+| RPG stats, leveling, skills, combat | `references/renpy-rpg.md` |
 | World maps, location navigation | `references/renpy-maps.md` |
-| Minigames (puzzles, rhythm, etc.) | `references/renpy-minigames.md` |
+| Minigames (puzzles, rhythm, QTE, cards) | `references/renpy-minigames.md` |
 | Complex UI / Screen Language | `references/renpy-screens.md` |
+| Survival stats, time/day cycle, action economy | `references/renpy-survival.md` |
+| Quest / mission system, objectives, rewards | `references/renpy-quests.md` |
+| Inventory: 5 item types, equipment, gifts, quest items, shops | `references/renpy-inventory.md` |
+| Sandbox / adult VN: relationship trees, scene unlock, gallery, NPC scheduling | `references/renpy-adult-vn.md` |
 
 Each reference file is self-contained. Read only what the project needs.
+
+**Cross-skill dependencies — heads-up**: the inventory pattern is touched by several skills (`renpy-quests` via `ItemObjective`, `renpy-adult-vn` via gifts, `renpy-screens` via the inventory screen, `renpy-rpg` via potions/equipment). `renpy-inventory.md` is the **canonical source**. The other skills define what they need locally and cross-ref back. Pick `renpy-inventory.md` early if your project will have any meaningful item economy beyond healing potions.
+
+### Subsystem combination guide
+
+For **sandbox life-sim / adult VN** projects (multiple characters, free-roam hub, survival loop):
+1. Start with `renpy-survival.md` — establish time cycle and stat management
+2. Add `renpy-inventory.md` — items, consumables, gifts for NPCs
+3. Add `renpy-quests.md` — define character quest chains (uses `ItemObjective` from inventory)
+4. Add `renpy-adult-vn.md` — wire relationship trees, scene gating, gallery, NPC schedules, gifting
+5. Add `renpy-maps.md` only if the world is large enough to need a visual map
+6. Add `renpy-rpg.md` only if there are combat mechanics (separate from survival stats)
+
+For **sandbox political / corruption sim** (life-sim with multi-dimensional reputation, NTR-style asymmetric progression, satirical tone):
+1. Start with `renpy-survival.md` — time cycle, slot economy, scheduled bills, debt ramp, day-of-week gating
+2. Add `renpy-inventory.md` — full 5-type system: consumables (energy/coca), equipment (suits), gifts (per-NPC affinity), quest items, key items, shops
+3. Add `renpy-adult-vn.md` — multi-stage scene chains, multi-dimensional NPC stats, opaque qualitative indicators, city-wide rumor meter, achievement system
+4. Add `renpy-quests.md` — staged quests, procedural quests, soft deadlines, category filtering
+5. Add `renpy-minigames.md` — universal continuous difficulty, gambling session economy (buy-in + caps), stat modifiers, narrative interrupts
+6. Add `renpy-maps.md` — flat sandbox variant, locked hotspots with reason tooltips, sub-zones, hotspot indicators
+7. Add `renpy-screens.md` — HUD top/bottom bars, themed phone overlay, stat-change notification queue, auto-hide HUD, responsive layouts
+8. **Skip** `renpy-rpg.md` — political sims rarely need combat or leveling
+
+For **dating sim with combat** (visual novel with relationship trees + RPG combat segments):
+1. `renpy-rpg.md` — stats, leveling, combat
+2. `renpy-inventory.md` — potions / equipment / gift items unified
+3. `renpy-adult-vn.md` — relationship trees, scene gating
+4. `renpy-quests.md` — quest chains tying combat to story
+
+For **small / minimal projects** (linear VN with a few collectibles):
+1. `main-renpy-skill.md` only — use the minimal Inventory in `renpy-rpg.md` § 4 if needed
+2. Skip `renpy-inventory.md` — overkill for a handful of pickups
+
+## 14. Official docs
+
+For specifics search here.
+
+[Ren's py Docs main page](https://www.renpy.org/doc/html/)
