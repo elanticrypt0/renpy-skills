@@ -2,6 +2,16 @@
 
 Use this when the project includes stats, leveling, skills, equipment, or RPG-like progression.
 
+## When NOT to use this skill
+
+Don't apply this skill to **life-sim / political-sim / sandbox VN** projects, even if they have numeric stats. RPG patterns (HP/ATK/DEF, leveling, combat turns) are a poor fit for narrative stats like *Influence*, *Reputation*, *Energy*, or *Mood*. For those:
+
+- **Survival-style stats** (energy, mood, fitness, money, daily decay) → use `renpy-survival.md`.
+- **Multi-dimensional narrative reputation** (trust, suspicion, public image) → use `renpy-adult-vn.md` § Multi-Dimensional NPC Stats and § City-Wide Reputation.
+- **Stats opaque to the player** (qualitative indicators instead of numbers) → use `renpy-adult-vn.md` § Opaque NPC Stats.
+
+The pieces of this skill that **do** translate to non-RPG games are: the `Inventory` / `Item` / `ITEM_CATALOGUE` pattern in Section 4 (reusable as-is) and the stat-check helper in Section 6 (the soft check pattern works for any threshold).
+
 ---
 
 ## Table of Contents
@@ -181,15 +191,22 @@ default player_skills = ["heal"]
 
 ## 4. Equipment & Items
 
+> **Full inventory system → see `renpy-inventory.md`** for the canonical reference: 5 item types (Consumable / Equipment / Gift / QuestItem / KeyItem), `ITEM_CATALOGUE` pattern, persistence, equipping, gifting, shop integration, and inventory screen with type filters.
+>
+> The minimal RPG-flavored version below is self-contained — sufficient for a small dungeon-crawler or combat-first project. For sandbox VNs, life-sim, dating sims, or anything with gifts/equipment/quest items, prefer the full skill.
+
+Minimal Item + Inventory (RPG-flavored, suitable for combat games with potions and weapons):
+
 ```renpy
 # systems/inventory_system.rpy
 
 init python:
 
     class Item:
-        """Base item class."""
+        """Minimal item class. For richer typing, use renpy-inventory.md."""
 
-        def __init__(self, item_id, name, description, item_type="misc", value=0, effect=None):
+        def __init__(self, item_id, name, description,
+                     item_type="misc", value=0, effect=None):
             self.item_id     = item_id
             self.name        = name
             self.description = description
@@ -213,7 +230,7 @@ init python:
 
 
     class Inventory:
-        """Manages a list of item_id strings with quantities."""
+        """Minimal inventory. For richer typing, use renpy-inventory.md."""
 
         def __init__(self):
             self._items = {}  # {item_id: quantity}
@@ -236,7 +253,6 @@ init python:
             return self._items.get(item_id, 0)
 
         def all_items(self):
-            """Returns list of (Item, quantity) tuples."""
             return [(ITEM_CATALOGUE[k], v) for k, v in self._items.items() if k in ITEM_CATALOGUE]
 
 
@@ -247,6 +263,8 @@ init python:
         store.player_inventory = Inventory()
         store.player_inventory.add("potion", 2)
 ```
+
+**When to upgrade to `renpy-inventory.md`**: if you need any of — gift affinity per NPC, quest-bound items that can't be sold, equipment with slot management and modifier hooks, hidden key items, max capacity, type-filtered inventory UI, shop helpers, persistent trophy items. The migration path is straightforward: the minimal `Item` / `Inventory` classes above are API-compatible subsets of the full ones.
 
 ---
 

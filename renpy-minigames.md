@@ -12,6 +12,13 @@ Use this when the project includes embedded minigames: puzzles, rhythm segments,
 5. [Card / Hand Game](#5-card--hand-game)
 6. [Passing Results Back to Story](#6-passing-results-back-to-story)
 7. [Difficulty & Balancing Hooks](#7-difficulty--balancing-hooks)
+8. [Universal Continuous Difficulty (0.0–1.0)](#8-universal-continuous-difficulty-0010)
+9. [MinigameResult Dataclass](#9-minigameresult-dataclass)
+10. [Blackjack Pattern (Complete)](#10-blackjack-pattern-complete)
+11. [Memory Pattern (Timed Solitaire)](#11-memory-pattern-timed-solitaire)
+12. [Minigame Session Economy (Buy-in + Caps)](#12-minigame-session-economy-buy-in--caps)
+13. [Stat Modifiers During Minigame](#13-stat-modifiers-during-minigame)
+14. [Narrative Event Interrupts](#14-narrative-event-interrupts)
 
 ---
 
@@ -471,3 +478,679 @@ python:
         time_limit=minigame_cfg("qte_time_limit"),
     )
 ```
+
+---
+
+## 8. Universal Continuous Difficulty (0.0–1.0)
+
+Instead of discrete `"easy" / "normal" / "hard"` levels, use a **continuous float in [0.0, 1.0]** that each minigame interprets through a pure derivation function. This makes balancing easier (tune one number per session) and lets you scale difficulty smoothly with player progress or context.
+
+```renpy
+# systems/minigame_difficulty.rpy
+
+init python:
+
+    def lerp(a, b, d):
+        """Linear interpolation between a and b by factor d (clamped to [0, 1])."""
+        d = max(0.0, min(1.0, d))
+        return a + (b - a) * d
+
+
+    # Reference ranges (informational; each minigame derives its own config):
+    # 0.00–0.20  tutorial / very easy
+    # 0.20–0.45  easy-normal
+    # 0.45–0.75  normal-hard
+    # 0.75–1.00  hard-extreme
+```
+
+**Each minigame defines a pure derivation function** `derive_X_config(d)`:
+
+```renpy
+init python:
+
+    def derive_qte_config(d):
+        """Universal difficulty → QTE-specific params."""
+        return {
+            "rounds":     int(round(lerp(4, 10, d))),
+            "time_limit": lerp(2.5, 0.8, d),
+        }
+
+    def derive_memory_config(d):
+        """Universal difficulty → memory grid params."""
+        if d < 0.25:
+            grid = (3, 2)
+        elif d < 0.50:
+            grid = (4, 3)
+        elif d < 0.80:
+            grid = (4, 4)
+        else:
+            grid = (5, 4)
+        return {
+            "grid":          grid,
+            "time_limit":    lerp(90, 30, d),
+            "miss_penalty":  lerp(0, 4, d),
+            "pre_peek_sec":  lerp(3, 0, d),
+            "trap_cards":    2 if d >= 0.80 else 0,
+        }
+```
+
+**Calling from a story label** — the caller decides the difficulty for this session:
+
+```renpy
+label minigame_memory_at_casino:
+    python:
+        cfg = derive_memory_config(0.55)   # mid-high difficulty
+        store._memory_state = TimedMemoryState(**cfg)
+    call screen timed_memory_screen(_memory_state)
+    $ result = _return
+    # ...
+```
+
+**Adding a new minigame**: write `derive_newgame_config(d)` returning the params. No global tables, no enum changes.
+
+---
+
+## 9. MinigameResult Dataclass
+
+Returning just `True` / `False` from a minigame is too thin for complex integrations. Use a richer `MinigameResult` so callers can read payout, stat deltas, and narrative flags.
+
+```renpy
+# systems/minigame_base.rpy
+
+init python:
+
+    class MinigameResult:
+        """Standardized return type for minigames."""
+
+        def __init__(self, outcome="loss", payout=0, stats_delta=None, narrative_flags=None):
+            self.outcome         = outcome           # "win", "loss", "draw", "abort"
+            self.payout          = payout            # net change in money for this session
+            self.stats_delta     = stats_delta or {} # {stat_name: delta} to apply on caller side
+            self.narrative_flags = narrative_flags or []  # list of flag strings to set on caller
+
+
+    def apply_minigame_result(result):
+        """Helper to apply a result to the global player state."""
+        if result.payout != 0:
+            store.player_survival.modify("money", result.payout)
+        for stat, delta in result.stats_delta.items():
+            store.player_survival.modify(stat, delta)
+        for flag in result.narrative_flags:
+            setattr(store, flag, True)
+```
+
+**Pattern for minigame state to produce a result**:
+
+```renpy
+init python:
+
+    class MinigameState:
+        # ... existing fields ...
+        def build_result(self):
+            """Override per minigame to construct a MinigameResult from current state."""
+            return MinigameResult(
+                outcome="win" if self.victory else "loss",
+                payout=0,
+                stats_delta={},
+                narrative_flags=[],
+            )
+```
+
+**Caller usage**:
+
+```renpy
+label minigame_blackjack_play:
+    python:
+        store._bj_state = BlackjackState(buy_in=30000, cap_gain=50000, difficulty=0.4)
+    call screen blackjack_screen(_bj_state)
+    python:
+        result = _bj_state.build_result()
+        apply_minigame_result(result)
+    if result.outcome == "win":
+        "You walk away with ${}.".format(result.payout)
+    elif result.outcome == "draw":
+        "You broke even."
+    else:
+        "You lost it all."
+```
+
+---
+
+## 10. Blackjack Pattern (Complete)
+
+Full blackjack implementation with hit / stand / double / split, multi-deck shoe, soft-17 toggle, configurable natural payout (3:2 vs 6:5), and an optional "rigged deck" knob for satirical or narrative contexts.
+
+```renpy
+# systems/minigame_blackjack.rpy
+
+init python:
+
+    import random
+
+    BJ_RANKS = list(range(1, 14))   # 1=A, 11=J, 12=Q, 13=K
+    BJ_SUITS = ["♠", "♥", "♦", "♣"]
+
+
+    class BJCard:
+        def __init__(self, rank, suit):
+            self.rank = rank
+            self.suit = suit
+
+        def value(self, ace_high=False):
+            if self.rank == 1:
+                return 11 if ace_high else 1
+            if self.rank >= 10:
+                return 10
+            return self.rank
+
+        def name(self):
+            faces = {1: "A", 11: "J", 12: "Q", 13: "K"}
+            return faces.get(self.rank, str(self.rank))
+
+        def display(self):
+            return "{}{}".format(self.name(), self.suit)
+
+
+    class BJShoe:
+        """Multi-deck shoe for blackjack."""
+        def __init__(self, n_decks=1, rigged_probability=0.0):
+            self.n_decks   = n_decks
+            self.rigged_p  = rigged_probability
+            self._reset()
+
+        def _reset(self):
+            self.cards = []
+            for _ in range(self.n_decks):
+                for r in BJ_RANKS:
+                    for s in BJ_SUITS:
+                        self.cards.append(BJCard(r, s))
+            random.shuffle(self.cards)
+
+        def draw(self, prefer_high_for_dealer=False):
+            """
+            With rigged_p probability, dealer draws an unusually good card.
+            Used for satirical "house always wins" hands. Otherwise random.
+            """
+            if prefer_high_for_dealer and random.random() < self.rigged_p:
+                # Pick a face card or 10
+                candidates = [i for i, c in enumerate(self.cards) if c.value() == 10]
+                if candidates:
+                    idx = random.choice(candidates)
+                    return self.cards.pop(idx)
+            if not self.cards:
+                self._reset()
+            return self.cards.pop()
+
+
+    def hand_value(cards):
+        """
+        Compute the best (highest <= 21) value of a blackjack hand.
+        Aces count as 11 unless that would bust.
+        """
+        total = sum(c.value() for c in cards)
+        aces  = sum(1 for c in cards if c.rank == 1)
+        # Upgrade aces from 1 → 11 while it doesn't bust
+        while aces > 0 and total + 10 <= 21:
+            total += 10
+            aces  -= 1
+        return total
+
+
+    def is_soft(cards):
+        """True if the hand counts at least one ace as 11."""
+        total = sum(c.value() for c in cards)
+        for _ in range(sum(1 for c in cards if c.rank == 1)):
+            if total + 10 <= 21:
+                return True
+            total += 1
+        return False
+
+
+    def is_natural(cards):
+        return len(cards) == 2 and hand_value(cards) == 21
+
+
+    class BlackjackState(MinigameState):
+        """
+        Full blackjack with hit/stand/double/split.
+        - buy_in / cap_gain define the session economy.
+        - difficulty (0-1) tunes deck count, soft-17 rule, payout ratio, rigged-deck probability.
+        """
+
+        def __init__(self, buy_in=5000, cap_gain=10000, difficulty=0.4):
+            super().__init__()
+            self.buy_in  = buy_in
+            self.cap_gain = cap_gain
+            self.chips    = buy_in
+            cfg = derive_blackjack_config(difficulty)
+            self.cfg      = cfg
+            self.shoe     = BJShoe(n_decks=cfg["n_decks"], rigged_probability=cfg["rigged_p"])
+            self.bet      = cfg["min_bet"]
+            self.hand     = []
+            self.dealer   = []
+            self.split    = None   # second hand if split
+            self.doubled  = False
+            self.in_round = False
+            self.message  = ""
+
+        def can_play(self):
+            return self.chips >= self.cfg["min_bet"] and not self.is_over()
+
+        def deal(self):
+            if not self.can_play():
+                self.lose()
+                return
+            self.in_round = True
+            self.chips   -= self.bet
+            self.hand    = [self.shoe.draw(), self.shoe.draw()]
+            self.dealer  = [self.shoe.draw(prefer_high_for_dealer=True), self.shoe.draw()]
+            self.doubled = False
+            self.split   = None
+            # Natural check
+            if is_natural(self.hand) and not is_natural(self.dealer):
+                payout = int(self.bet * (1 + self.cfg["natural_payout"]))
+                self.chips += payout
+                self.message = "Blackjack!"
+                self._end_round()
+            elif is_natural(self.dealer):
+                self.message = "Dealer blackjack."
+                self._end_round()
+
+        def hit(self, on_split=False):
+            target = self.split if on_split else self.hand
+            target.append(self.shoe.draw())
+            if hand_value(target) > 21:
+                if on_split:
+                    self.split = None
+                else:
+                    self.message = "Bust."
+                    self._end_round()
+
+        def stand(self):
+            self._dealer_play()
+            self._resolve_round()
+
+        def double_down(self):
+            if not self.cfg["allow_double"] or self.chips < self.bet:
+                return
+            self.chips  -= self.bet
+            self.bet    *= 2
+            self.doubled = True
+            self.hit()
+            if hand_value(self.hand) <= 21:
+                self.stand()
+
+        def split_hand(self):
+            if (not self.cfg["allow_split"] or
+                len(self.hand) != 2 or self.hand[0].rank != self.hand[1].rank or
+                self.chips < self.bet):
+                return
+            self.chips -= self.bet
+            self.split = [self.hand.pop(), self.shoe.draw()]
+            self.hand.append(self.shoe.draw())
+
+        def _dealer_play(self):
+            """Dealer hits until 17. Soft-17 toggle from config."""
+            while True:
+                val = hand_value(self.dealer)
+                if val > 21:
+                    return
+                if val < 17:
+                    self.dealer.append(self.shoe.draw())
+                    continue
+                if val == 17 and is_soft(self.dealer) and self.cfg["hit_soft_17"]:
+                    self.dealer.append(self.shoe.draw())
+                    continue
+                return
+
+        def _resolve_round(self):
+            player_val = hand_value(self.hand)
+            dealer_val = hand_value(self.dealer)
+
+            if player_val > 21:
+                self.message = "Bust."
+            elif dealer_val > 21 or player_val > dealer_val:
+                self.chips += self.bet * 2
+                self.message = "You win ${}.".format(self.bet)
+            elif player_val == dealer_val:
+                self.chips += self.bet
+                self.message = "Push."
+            else:
+                self.message = "Dealer wins."
+
+            self._end_round()
+
+        def _end_round(self):
+            self.in_round = False
+            # Cap-gain enforcement: if winnings exceed cap, force player out
+            if self.chips - self.buy_in >= self.cap_gain:
+                self.message += " (table limit reached — cashout)"
+                self.win()
+            elif self.chips < self.cfg["min_bet"]:
+                self.message += " (busted out)"
+                self.lose()
+
+        def cash_out(self):
+            """Player voluntarily ends session."""
+            if self.chips >= self.buy_in:
+                self.win()
+            else:
+                self.lose()
+
+        def build_result(self):
+            """Convert chips → MinigameResult."""
+            net = self.chips - self.buy_in
+            return MinigameResult(
+                outcome="win" if net > 0 else "draw" if net == 0 else "loss",
+                payout=net,
+            )
+
+
+    def derive_blackjack_config(d):
+        """Universal difficulty → blackjack params."""
+        return {
+            "n_decks":         int(round(lerp(1, 6, d))),
+            "hit_soft_17":     d >= 0.5,
+            "allow_double":    True,
+            "allow_split":     d < 0.8,                    # restrict at high difficulty
+            "natural_payout":  lerp(1.5, 1.2, d),          # 3:2 → 6:5 as difficulty rises
+            "rigged_p":        lerp(0.0, 0.15, d),         # satirical knob
+            "min_bet":         max(100, int(d * 1000)),
+        }
+```
+
+The screen for blackjack follows the standard 3-layer pattern from Section 2 — render `state.hand`, `state.dealer`, expose buttons for `hit/stand/double/split/cash_out`. Use `renpy.restart_interaction` after each player action.
+
+---
+
+## 11. Memory Pattern (Timed Solitaire)
+
+Solitaire memory match against a timer. Optional "trap cards" with no pair, and a pre-peek period where all cards are briefly visible.
+
+```renpy
+# systems/minigame_memory_timed.rpy
+
+init python:
+
+    import random
+
+    class TimedMemoryState(MinigameState):
+        """
+        Memory match against the clock.
+        - grid: (cols, rows)
+        - time_limit: seconds
+        - pre_peek_sec: cards visible at start
+        - trap_cards: number of cards with no pair (decoy)
+        - miss_penalty: seconds removed per unsuccessful flip
+        """
+
+        def __init__(self, grid=(4, 4), time_limit=60.0,
+                     pre_peek_sec=1.0, trap_cards=0,
+                     miss_penalty=2.0):
+            super().__init__()
+            self.cols, self.rows = grid
+            cells = self.cols * self.rows
+            n_pairs = (cells - trap_cards) // 2
+            values  = list(range(n_pairs)) * 2 + [-1] * trap_cards
+            random.shuffle(values)
+            self.grid = [values[i*self.cols:(i+1)*self.cols] for i in range(self.rows)]
+            self.revealed     = [[False]*self.cols for _ in range(self.rows)]
+            self.matched      = [[False]*self.cols for _ in range(self.rows)]
+            self._selected    = []
+            self.moves        = 0
+            self.misses       = 0
+            self.time_left    = time_limit
+            self.time_total   = time_limit
+            self.pre_peek_sec = pre_peek_sec
+            self.miss_penalty = miss_penalty
+            self.pairs_needed = n_pairs
+            self.pairs_found  = 0
+
+        def is_face_up(self, r, c):
+            if self.pre_peek_sec > 0:
+                return True   # all visible during peek
+            return self.revealed[r][c] or self.matched[r][c]
+
+        def select(self, r, c):
+            if self.pre_peek_sec > 0 or self.is_over():
+                return
+            if self.matched[r][c] or (r, c) in self._selected:
+                return
+
+            if len(self._selected) >= 2:
+                for rr, cc in self._selected:
+                    if not self.matched[rr][cc]:
+                        self.revealed[rr][cc] = False
+                self._selected = []
+
+            self.revealed[r][c] = True
+            self._selected.append((r, c))
+
+            if len(self._selected) == 2:
+                self.moves += 1
+                r1, c1 = self._selected[0]
+                r2, c2 = self._selected[1]
+                v1 = self.grid[r1][c1]
+                v2 = self.grid[r2][c2]
+                if v1 == v2 and v1 != -1:
+                    self.matched[r1][c1] = True
+                    self.matched[r2][c2] = True
+                    self.pairs_found += 1
+                    self._selected = []
+                    if self.pairs_found >= self.pairs_needed:
+                        self.win()
+                else:
+                    self.misses += 1
+                    self.time_left -= self.miss_penalty
+
+        def tick(self, dt):
+            if self.is_over():
+                return
+            if self.pre_peek_sec > 0:
+                self.pre_peek_sec = max(0, self.pre_peek_sec - dt)
+                return
+            self.time_left -= dt
+            if self.time_left <= 0:
+                self.lose()
+
+        def time_bonus_payout(self, cap):
+            """Linear: % of time left → % of cap_gain."""
+            if not self.victory:
+                return 0
+            pct = max(0, self.time_left) / self.time_total
+            return int(cap * pct)
+
+        def build_result(self):
+            return MinigameResult(
+                outcome="win" if self.victory else "loss",
+                payout=0,   # caller calculates with time_bonus_payout(cap)
+            )
+```
+
+The screen follows the pattern from Section 4 with an added timer bar and pre-peek indicator.
+
+---
+
+## 12. Minigame Session Economy (Buy-in + Caps)
+
+Casinos and gambling minigames need an economy framing: pay buy-in to enter, win up to a per-session cap, with optional weekly accumulation caps to prevent infinite farming.
+
+```renpy
+# systems/minigame_economy.rpy
+
+init python:
+
+    class MinigameTable:
+        """A table configuration: buy-in + cap of winnings per session."""
+
+        def __init__(self, table_id, name, buy_in, cap_gain, difficulty,
+                     unlock_condition=None):
+            self.table_id        = table_id
+            self.name            = name
+            self.buy_in          = buy_in
+            self.cap_gain        = cap_gain
+            self.difficulty      = difficulty
+            self.unlock_condition = unlock_condition
+
+        def is_unlocked(self):
+            return self.unlock_condition is None or self.unlock_condition()
+
+
+    BLACKJACK_TABLES = {
+        "basic":   MinigameTable("basic",   "Basic table",     5000,    10000, 0.20),
+        "mid":     MinigameTable("mid",     "Mid table",      30000,    50000, 0.40),
+        "high":    MinigameTable("high",    "High table",     70000,   100000, 0.55),
+        "vip":     MinigameTable("vip",     "VIP table",     120000,   250000, 0.70,
+                                 unlock_condition=lambda: store.influence >= 50),
+        "high_roller": MinigameTable("high_roller", "High Roller", 300000, 500000, 0.85,
+                                     unlock_condition=lambda: store.influence >= 70),
+    }
+
+
+    # Weekly cap of net minigame gains to prevent farming.
+    default weekly_gambling_cap = 200000
+    default weekly_gambling_used = 0
+
+
+    def play_table(table_id, state_factory):
+        """
+        Enter a table, charge buy-in, run minigame, return result.
+        Honors per-session cap (handled in state) and weekly cap.
+        """
+        table = BLACKJACK_TABLES.get(table_id)
+        if not table or not table.is_unlocked():
+            renpy.notify("Table unavailable.")
+            return None
+        if store.player_survival.money < table.buy_in:
+            renpy.notify("Not enough money for buy-in.")
+            return None
+
+        store.player_survival.modify("money", -table.buy_in)
+        state = state_factory(table.buy_in, table.cap_gain, table.difficulty)
+        return state
+
+
+    def apply_table_winnings(result):
+        """Apply minigame result to money, honoring the weekly cap."""
+        if result.payout <= 0:
+            apply_minigame_result(result)
+            return
+        # Cap weekly net gambling income
+        remaining = max(0, store.weekly_gambling_cap - store.weekly_gambling_used)
+        actual_payout = min(result.payout, remaining)
+        if actual_payout < result.payout:
+            renpy.notify("House noticed you — winnings capped this week.")
+        result.payout = actual_payout
+        store.weekly_gambling_used += actual_payout
+        apply_minigame_result(result)
+
+
+    def reset_weekly_gambling_cap():
+        """Call on Monday rollover."""
+        store.weekly_gambling_used = 0
+```
+
+---
+
+## 13. Stat Modifiers During Minigame
+
+Player stats (energy, charisma, etc.) can modify a minigame's parameters at runtime. Apply them when constructing the state, before showing the screen.
+
+```renpy
+init python:
+
+    def apply_player_modifiers(cfg, minigame_name):
+        """
+        Mutate a derived config dict in-place based on current player stats.
+        Returns the modified cfg.
+        """
+        # Energy tier modifier (see renpy-survival.md section 10)
+        e_tier = energy_tier()   # "high" / "mid" / "low"
+        if minigame_name == "memory":
+            if e_tier == "high":
+                cfg["pre_peek_sec"] = cfg.get("pre_peek_sec", 0) + 1
+            elif e_tier == "low":
+                cfg["time_limit"]   *= 0.8
+                cfg["miss_penalty"] += 1
+
+        if minigame_name == "blackjack":
+            if e_tier == "low":
+                # Player has slower reflexes — UI delays slightly (signaled to screen)
+                cfg["ui_delay_sec"] = 0.4
+
+        # Influence modifier — e.g., bribe the dealer
+        if minigame_name == "blackjack" and getattr(store, "influence", 0) >= 50:
+            cfg["bribe_dealer_available"] = True
+
+        return cfg
+
+
+# Usage
+python:
+    cfg = derive_memory_config(0.55)
+    cfg = apply_player_modifiers(cfg, "memory")
+    store._memory_state = TimedMemoryState(**{k:v for k,v in cfg.items() if k in TimedMemoryState.__init__.__code__.co_varnames})
+```
+
+---
+
+## 14. Narrative Event Interrupts
+
+Sometimes mid-minigame, a story event should fire (an NPC sits at the table, a bouncer approaches, paparazzi appears). Use a callback hook between rounds/moves.
+
+```renpy
+init python:
+
+    class MinigameInterruptHook:
+        """
+        Callback registry. Each minigame state checks for fired interrupts
+        between turns / rounds / moves and calls renpy.call() if triggered.
+        """
+
+        def __init__(self):
+            self.pending = []  # list of (condition_callable, label_to_call)
+
+        def register(self, condition, label):
+            self.pending.append((condition, label))
+
+        def check_and_fire(self):
+            still_pending = []
+            for cond, label in self.pending:
+                if cond():
+                    renpy.call_in_new_context(label)
+                else:
+                    still_pending.append((cond, label))
+            self.pending = still_pending
+
+
+default minigame_interrupts = None
+
+init python:
+    def init_minigame_interrupts():
+        store.minigame_interrupts = MinigameInterruptHook()
+```
+
+**Wire into your minigame state**:
+
+```renpy
+# At the end of BlackjackState._end_round, or between QTE rounds:
+if store.minigame_interrupts:
+    store.minigame_interrupts.check_and_fire()
+```
+
+**Registering an event before the minigame**:
+
+```renpy
+label minigame_blackjack_with_event:
+    python:
+        # Register: after 2 rounds, an NPC sits down
+        rounds_played = [0]
+        store.minigame_interrupts.register(
+            condition=lambda: rounds_played[0] >= 2,
+            label="event_npc_joins_table",
+        )
+        store._bj_state = BlackjackState(buy_in=30000, cap_gain=50000, difficulty=0.4)
+    # ... continue minigame
+```
+
+The interrupt label can show dialogue, modify stats, and the minigame resumes after `return`.
